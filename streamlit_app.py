@@ -263,33 +263,63 @@ def solve_optimization(
 st.title("📦 Supply Chain Decision Support")
 
 st.markdown("""
-**Goal:** Minimize expected costs (Orders + Holding + Backlog).
-This tool optimizes ordering decisions for the current week using scenario-based stochastic programming.
+### 🎯 Objective
+Minimize total costs over the next 8 weeks.
+*   **Holding Cost**: $1.0 / unit / week (avoid excess inventory)
+*   **Backorder Cost**: $2.5 / unit / week (avoid stockouts)
+
+### 📝 Instructions
+1.  **Enter Current Status**: Input your current inventory and backlog from the game.
+2.  **Update Pipeline**: Enter orders *already placed* that will arrive in T+1, T+2, T+3.
+3.  **Check Disruption**: Set the disruption status if active.
+4.  **Run Optimizer**: The tool will simulate 300 futures to find the best order for *this week*.
 """)
 
 with st.sidebar:
     st.header("1. Game Parameters")
-    horizon = st.number_input("Planning Horizon (Weeks)", 4, 12, 8)
-    n_scenarios = st.number_input("Scenarios", 10, 1000, 300)
+    horizon = st.number_input(
+        "Planning Horizon (Weeks)", 4, 12, 8,
+        help="How far ahead the model looks. 8 weeks is usually sufficient."
+    )
+    n_scenarios = st.number_input(
+        "Scenarios", 10, 1000, 300,
+        help="Number of random futures to simulate. Higher = more accurate but slower."
+    )
     seed = st.number_input("Random Seed", 0, 9999, 42)
     
     st.header("2. Current State (Week T)")
     
     st.subheader("Inventory Status")
+    st.caption("Input the state at the *start* of the current week, before demand/arrivals.")
     col1, col2 = st.columns(2)
     current_week = col1.number_input("Current Week #", 1, 50, 1)
-    on_hand = col1.number_input("On-hand Inventory (Start)", 0, 10000, 1000)
-    backlog = col2.number_input("Backorders (Start)", 0, 10000, 0)
+    on_hand = col1.number_input("On-hand Inventory", 0, 10000, 1000)
+    backlog = col2.number_input("Backorders", 0, 10000, 0)
     
     st.subheader("Pipeline (Incoming)")
-    st.caption("Enter quantities ALREADY ordered/arriving.")
-    pipe_local = st.number_input("Local Arriving Next Week (T+1)", 0, 5000, 0)
-    pipe_os1 = st.number_input("Overseas Arriving in 1 wk (T+1)", 0, 5000, 0)
-    pipe_os2 = st.number_input("Overseas Arriving in 2 wks (T+2)", 0, 5000, 0)
-    pipe_os3 = st.number_input("Overseas Arriving in 3 wks (T+3)", 0, 5000, 0)
+    st.caption("Enter quantities ALREADY ordered that are arriving soon.")
+    pipe_local = st.number_input(
+        "Local Arriving Next Week (T+1)", 0, 5000, 0,
+        help="Order placed last week (T-1). Arrives start of next week."
+    )
+    pipe_os1 = st.number_input(
+        "Overseas Arriving in 1 wk (T+1)", 0, 5000, 0,
+        help="Order placed 3 weeks ago. Arrives start of next week."
+    )
+    pipe_os2 = st.number_input(
+        "Overseas Arriving in 2 wks (T+2)", 0, 5000, 0,
+        help="Order placed 2 weeks ago."
+    )
+    pipe_os3 = st.number_input(
+        "Overseas Arriving in 3 wks (T+3)", 0, 5000, 0,
+        help="Order placed last week."
+    )
     
     st.subheader("Disruption Status")
-    disruption_rem = st.slider("Disruption Remaining Weeks", 0, 3, 0, help="0 = Not disrupted. 1-3 = Active.")
+    disruption_rem = st.slider(
+        "Disruption Remaining Weeks", 0, 3, 0, 
+        help="0 = Normal. 1-3 = Currently disrupted. Overseas will be unavailable."
+    )
     
     st.subheader("Supplier Setup")
     local_on = st.checkbox("Local Supplier Enabled", True)
@@ -317,29 +347,53 @@ if 'res' in st.session_state:
     # --- Main Recommendation ---
     st.markdown("---")
     st.subheader(f"✅ Recommendations for Week {current_week}")
+    st.caption("Enter these orders into the game *now*.")
     
     col_rec1, col_rec2 = st.columns(2)
     
     with col_rec1:
-        st.info("**Local Order** (Cost 6.5)")
+        st.info("**Local Order** (Cost 6.5, Lead 1 wk)")
         st.metric("Quantity", f"{res['local_order']:,.0f}", delta=None)
+        st.caption("Quick but expensive. Use when backlog triggers are high.")
         
     with col_rec2:
-        st.info("**Overseas Order** (Cost 5.0)")
+        st.info("**Overseas Order** (Cost 5.0, Lead 3 wks)")
         st.metric("Quantity", f"{res['overseas_order']:,.0f}", delta=None)
+        st.caption("Cheap but slow. Main source of stock.")
     
     # --- Risk Analysis ---
     st.markdown("### 📊 Predicted Outcomes (End of Week T+1)")
+    st.caption("Projected status *after* current decisions takes effect (Next Week).")
     r1, r2, r3 = st.columns(3)
-    r1.metric("Backorder Probability", f"{res['prob_backorder_t1']*100:.1f}%")
-    r2.metric("Expected Net Inventory", f"{res['expected_inv_t1']:,.0f}")
-    r3.metric("Avg Scenario Cost", f"${res['df_costs']['Cost'].mean():,.0f}")
+    r1.metric(
+        "Backorder Risk", 
+        f"{res['prob_backorder_t1']*100:.1f}%",
+        help="Probability of having ANY backorders next week."
+    )
+    r2.metric(
+        "Exp. Net Inventory", 
+        f"{res['expected_inv_t1']:,.0f}",
+        help="Average projected inventory (Inventory - Backlog)."
+    )
+    r3.metric(
+        "Avg Scenario Cost", 
+        f"${res['df_costs']['Cost'].mean():,.0f}",
+        help="Average total cost over the 8-week horizon."
+    )
     
     # --- Visualizations ---
     tab1, tab2 = st.tabs(["Inventory Projection", "Cost Distribution"])
     
     with tab1:
         st.markdown("#### Inventory Fan Chart (Net Inventory)")
+        st.info(
+            """
+            **How to read:**
+            *   **Blue Line (Middle)**: Most likely inventory level.
+            *   **Shaded Area**: Range of outcomes (10th to 90th percentile).
+            *   **Risk**: If the shaded area drops below 0, there is a risk of backlog.
+            """
+        )
         # Aggregate stats by week
         df = res['df_sim']
         stats = df.groupby("Week")["Net Inventory"].quantile([0.1, 0.5, 0.9]).unstack()
@@ -361,10 +415,17 @@ if 'res' in st.session_state:
         )
         
         st.altair_chart((area + line).interactive(), use_container_width=True)
-        st.caption("Shaded area: 10th-90th percentile range. Line: Median.")
     
     with tab2:
         st.markdown("#### Cost Distribution across Scenarios")
+        st.info(
+            """
+            **How to read:**
+            *   **Bars**: Show how many scenarios result in a specific total cost.
+            *   **Goal**: You want tall bars on the *left* (low cost).
+            *   **Tail**: Bars far to the *right* show "disaster" scenarios (high cost).
+            """
+        )
         chart = alt.Chart(res['df_costs']).mark_bar().encode(
             x=alt.X("Cost", bin=True),
             y='count()'
