@@ -282,10 +282,18 @@ def show_optimizer():
 
     with st.sidebar:
         st.header("1. Game Parameters")
-        horizon = st.number_input(
-            "Planning Horizon (Weeks)", 4, 12, 8,
-            help="How far ahead the model looks. 8 weeks is usually sufficient."
+        
+        # Dynamic Game Length Logic
+        final_week = 20 # Default
+        if st.session_state.get('current_week_input', 1) > 20:
+            final_week = 30
+            st.warning("⚠️ Game extended to 30 weeks!")
+            
+        settings_horizon = st.number_input(
+            "Max Lookahead (Weeks)", 4, 12, 8,
+            help="How many weeks ahead the model optimizes."
         )
+        
         n_scenarios = st.number_input(
             "Scenarios", 10, 1000, 300,
             help="Number of random futures to simulate. Higher = more accurate but slower."
@@ -295,12 +303,31 @@ def show_optimizer():
         st.header("2. Current State (Week T)")
         
         st.subheader("Inventory Status")
-        st.caption("Input the state at the *start* of the current week, before demand/arrivals.")
+        st.caption("Input the state at the *start* of the current week.")
         col1, col2 = st.columns(2)
-        current_week = col1.number_input("Current Week #", 1, 50, 1)
+        current_week = col1.number_input("Current Week #", 1, 50, 1, key='current_week_input')
         on_hand = col1.number_input("On-hand Inventory", 0, 10000, 1000)
         backlog = col2.number_input("Backorders", 0, 10000, 0)
         
+        # Calculate Effective Horizon
+        weeks_remaining = final_week - current_week + 1
+        effective_horizon = min(settings_horizon, weeks_remaining)
+        
+        # Determine if we apply Terminal Value
+        # Apply it unless we are literally at the end of the game (lookahead reaches final week)
+        # If weeks_remaining <= settings_horizon, we are seeing the "End of the World".
+        # If we see the end, we SHOULDN'T apply terminal value? 
+        # Actually, if we are at Week 19 of 20, we want to end Week 20 with 0.
+        # So: Apply Terminal Value ONLY if weeks_remaining > settings_horizon.
+        # i.e., The game continues BEYOND what we can see.
+        apply_terminal = weeks_remaining > settings_horizon
+        
+        st.info(f" optimizing for {effective_horizon} weeks. (End: W{current_week + effective_horizon - 1})")
+        if apply_terminal:
+            st.success("🔄 Infinite Horizon Mode (Holding stock for future)")
+        else:
+            st.warning("🏁 End Game Mode (Draining inventory)")
+
         st.subheader("Pipeline (Incoming)")
         st.caption("Enter quantities ALREADY ordered that are arriving soon.")
         pipe_local = st.number_input(
@@ -335,13 +362,14 @@ def show_optimizer():
     if run_btn:
         with st.spinner("Generating scenarios and optimizing..."):
             # 1. Generate Scenarios
-            scenarios = generate_scenarios(n_scenarios, horizon, disruption_rem, seed)
+            scenarios = generate_scenarios(n_scenarios, effective_horizon, disruption_rem, seed)
             
             # 2. Solve
             res = solve_optimization(
                 on_hand, backlog, 
                 pipe_local, pipe_os1, pipe_os2, pipe_os3,
-                scenarios, horizon, local_on, overseas_on
+                scenarios, effective_horizon, local_on, overseas_on,
+                apply_terminal_value=apply_terminal
             )
             
             st.session_state['res'] = res
