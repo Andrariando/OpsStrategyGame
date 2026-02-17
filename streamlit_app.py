@@ -214,12 +214,21 @@ def show_logic():
     st.title("🧠 Model Logic & Assumptions")
     
     st.markdown("""
-    ### 1. The optimization Approach
+    ### 1. The Optimization Approach
     This tool uses **Two-Stage Stochastic Programming** to make the best decision for the *current* week, considering uncertain future events.
     
-    *   **Scenario Generation**: We simulate **300 possible futures** for the next 8 weeks.
-    *   **Uncertainty**: In each future, demand fluctuates (Normal distribution) and disruptions may randomly occur (10% chance).
-    *   **Optimization**: We use a Linear Programming solver (PuLP) to find the single best `Local Order` and `Overseas Order` for *now* that minimizes the *average* cost across all 300 futures.
+    #### Why "300 Futures"?
+    We simulate 300 independent timelines (scenarios) because the future is uncertain in **two ways**:
+    
+    1.  **variable Demand**: In every week of every scenario, demand is random (drawn from a Bell curve).
+        *   *Scenario 1* might have consistently high demand.
+        *   *Scenario 2* might have low demand.
+    2.  **Random Disruption**: In every week, there is a **10% chance** of a disruption starting.
+        *   *Scenario A*: No disruption ever occurs (Smooth sailing).
+        *   *Scenario B*: Disruption hits immediately in Week 1.
+        *   *Scenario C*: Disruption hits late in Week 6.
+    
+    By optimizing across all 300 combined possibilities, we find an order quantity that is **robust**—it minimizes your *average* cost whether you get lucky (no disruption) or unlucky.
     
     ### 2. Game Parameters & Costs
     The model is hard-coded with the following game rules:
