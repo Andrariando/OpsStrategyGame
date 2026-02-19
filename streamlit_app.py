@@ -7,18 +7,19 @@ import altair as alt
 import scipy.stats as stats
 
 # --- Configuration & Constants ---
+# --- Configuration & Constants ---
 OVERSEAS_COST = 5.0
-LOCAL_COST = 6.5
+LOCAL_COST = 7.5      # Increased from 6.5
 HOLDING_COST = 1.0
-BACKORDER_COST = 2.5
+BACKORDER_COST = 3.0  # Increased from 2.5
 LOCAL_LEAD_TIME = 1
-OVERSEAS_LEAD_TIME = 3
+OVERSEAS_LEAD_TIME = 4 # Increased from 3
 LOCAL_CAPACITY = 500
 DISRUPTION_CHANCE = 0.10
-DISRUPTION_DURATION = 3
-DEMAND_MEAN_NORMAL = 600
+DISRUPTION_DURATION = 5 # Increased from 3
+DEMAND_MEAN_NORMAL = 500 # Changed from 600
 DEMAND_MEAN_DISRUPTED = 1200
-DEMAND_STD = 250
+DEMAND_STD = 350      # Changed from 250
 
 st.set_page_config(page_title="Supply Chain Support", layout="wide")
 
@@ -236,7 +237,8 @@ def solve_optimization(
     scenarios,
     horizon,
     local_enabled,
-    overseas_enabled
+    overseas_enabled,
+    apply_terminal_value=False
 ):
     # PuLP Problem
     prob = pulp.LpProblem("SupplyChainOptimization", pulp.LpMinimize)
@@ -324,6 +326,21 @@ def solve_optimization(
                 scenario_cost += OVERSEAS_COST * get_overseas_order(t)
         
         total_cost_expr += scenario_cost
+
+        # --- Terminal Value (End of Horizon) ---
+        # If we are in "Mid-Game" (apply_terminal_value=True), we must not drain inventory.
+        # We credit the ending inventory to avoid "end of world" behavior.
+        # Valuation: We value it at OVERSEAS_COST (conservative replacement cost).
+        if apply_terminal_value:
+            # Credit Ending Inventory: - (Inv_T * Value)
+            # We subtract this from the Cost to minimize.
+            # This encourages the solver to leave inventory > 0 if it's useful.
+            # Note: We do NOT credit pipeline, as that's already paid for? 
+            # actually, standard practice is just to ensure we don't dump.
+            # Let's subtract (Ending Inventory * OVERSEAS_COST) from the objective.
+            
+            end_inv = inv_vars[(horizon-1, s_idx)]
+            total_cost_expr -= end_inv * OVERSEAS_COST
 
     prob += total_cost_expr * (1/N)
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
@@ -447,39 +464,34 @@ def show_optimizer():
         # Allow manual override of the "Max Weeks"
         game_length_option = st.radio(
             "Game Duration", 
-            ["Standard (20 Weeks)", "Extended (30 Weeks)"],
+            ["Standard (20 Weeks)", "Extended (30 Weeks)", "Infinite (Indefinite)"],
             horizontal=True,
             help="Select the total number of weeks in the game."
         )
-        final_week = 20 if "20" in game_length_option else 30
-
-        col1, col2 = st.columns(2)
-        current_week = col1.number_input("Current Week #", 1, 50, 1)
         
-        # Calculate Effective Horizon
-        weeks_remaining = final_week - current_week + 1
-        
-        # Default settings (hidden by default)
-        with st.expander("⚙️ Advanced Model Settings"):
-            settings_horizon = st.number_input("Max Lookahead", 4, 12, 8)
-            n_scenarios = st.number_input("Scenarios", 10, 1000, 300)
-            seed = st.number_input("Random Seed", 0, 9999, 42)
-        
-        effective_horizon = min(settings_horizon, weeks_remaining)
-        apply_terminal = weeks_remaining > settings_horizon
-        
-        # Status Panel
-        if apply_terminal:
-            st.success(f"🟢 **Mid-Game Strategy**\n\nOptimizing for **{effective_horizon} weeks** ahead.\n\nMaintains inventory for future weeks.")
+        if "Infinite" in game_length_option:
+            final_week = 999 # Effectively infinite
+            apply_terminal = True
+            effective_horizon = settings_horizon
+            st.success(f"♾️ **Infinite Horizon Strategy**\n\nOptimizing for **{effective_horizon} weeks** ahead.\n\nAssumes the game goes on forever (Steady State).")
         else:
-            st.warning(f"🏁 **End-Game Strategy**\n\nOptimizing for final **{weeks_remaining} weeks**.\n\nDraining inventory to zero by Week {final_week}.")
+            final_week = 20 if "20" in game_length_option else 30
+            # Calculate Effective Horizon
+            weeks_remaining = final_week - current_week + 1
+            effective_horizon = min(settings_horizon, weeks_remaining)
+            apply_terminal = weeks_remaining > settings_horizon
+            
+            if apply_terminal:
+                st.info(f"🟢 **Mid-Game Strategy**\n\nOptimizing for **{effective_horizon} weeks** ahead.")
+            else:
+                st.warning(f"🏁 **End-Game Strategy**\n\nOptimizing for final **{weeks_remaining} weeks**.\n\nDraining inventory.")
 
         st.divider()
         st.header("2. Current Inventory")
         st.caption("Input start-of-week status.")
         
         col_inv, col_back = st.columns(2)
-        on_hand = col_inv.number_input("On-hand", 0, 10000, 1000)
+        on_hand = col_inv.number_input("On-hand", 0, 10000, 2500)
         backlog = col_back.number_input("Backorders", 0, 10000, 0)
         
         st.subheader("Pipeline (Incoming)")
