@@ -460,6 +460,15 @@ def show_optimizer():
     with st.sidebar:
         st.header("1. Game Status")
         
+        col1, col2 = st.columns(2)
+        current_week = col1.number_input("Current Week #", 1, 50, 1)
+
+        # Default settings (hidden by default)
+        with st.expander("⚙️ Advanced Model Settings"):
+            settings_horizon = st.number_input("Max Lookahead", 4, 12, 8)
+            n_scenarios = st.number_input("Scenarios", 10, 1000, 300)
+            seed = st.number_input("Random Seed", 0, 9999, 42)
+
         # --- Game Phase & Week ---
         # Allow manual override of the "Max Weeks"
         game_length_option = st.radio(
