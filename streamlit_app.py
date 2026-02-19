@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pulp
 import altair as alt
+import scipy.stats as stats
 
 # --- Configuration & Constants ---
 OVERSEAS_COST = 5.0
@@ -64,6 +65,165 @@ def generate_scenarios(n_scenarios, horizon, start_disruption_weeks, seed=None):
         })
     
     return scenarios
+
+# --- Base Stock Policy Benchmark ---
+
+def calculate_optimal_base_stock():
+    """
+    Calculates the theoretical Base Stock level (B) based on the Critical Ratio.
+    Policy assumes Normal Demand and Overseas Supplier (Primary).
+    """
+    # Critical Ratio (Service Level Target)
+    # Cu = Backorder Cost, Co = Holding Cost
+    # CR = Cu / (Cu + Co)
+    critical_ratio = BACKORDER_COST / (BACKORDER_COST + HOLDING_COST)
+    
+    # Lead Time + Review Period
+    # We review every week (r=1). Lead time L=3.
+    L = OVERSEAS_LEAD_TIME
+    r = 1
+    review_plus_lead = r + L
+    
+    # Demand during coverage period
+    mu_L = DEMAND_MEAN_NORMAL * review_plus_lead
+    sigma_L = DEMAND_STD * np.sqrt(review_plus_lead)
+    
+    # Z-score for Critical Ratio
+    z = stats.norm.ppf(critical_ratio)
+    
+    # Base Stock Formula: B = mu_L + z * sigma_L
+    base_stock = mu_L + z * sigma_L
+    
+    return base_stock, critical_ratio
+
+def simulate_base_stock_policy(
+    base_stock_level,
+    current_inventory,
+    current_backlog,
+    pipe_local_next,
+    pipe_os_1, pipe_os_2, pipe_os_3,
+    scenarios,
+    horizon,
+    local_enabled,
+    overseas_enabled
+):
+    """
+    Simulates a 'Naive' Base Stock policy over the same scenarios.
+    It purely uses the Overseas supplier to perform Order-Up-To B.
+    It ignores future disruption risks (reactive).
+    """
+    results = []
+    
+    for s_idx, scenario in enumerate(scenarios):
+        # Initialize State for this scenario path
+        inv = current_inventory
+        back = current_backlog
+        
+        # Pipeline orders (tracked by arrival time)
+        # arrivals[0] = arriving T (now/processing), arrivals[1] = T+1, etc.
+        # We model pipeline simply as a list of incoming orders.
+        # Initial Pipeline:
+        # T+1: pipe_local_next + pipe_os_1
+        # T+2: pipe_os_2
+        # T+3: pipe_os_3
+        # T+4+: 0
+        
+        pipeline = {
+            1: pipe_local_next + pipe_os_1,
+            2: pipe_os_2,
+            3: pipe_os_3
+        }
+        
+        total_cost = 0
+        scenario_history = []
+        
+        for t in range(horizon):
+            # 1. Determine Inventory Position (IP)
+            # IP = Net Inventory + On Order (arriving T+1 onwards)
+            # Pipeline keys > t represent future arrivals relative to NOW (t=0)
+            # But inside the loop, 't' moves.
+            # arrivals at 't' are consumed.
+            # arrivals > 't' are on order.
+            
+            # Correction: Dictionary 'pipeline' stores ABSOLUTE arrival times (0, 1, 2...).
+            # 'pulp' model treats t=0 as "Decide Now".
+            # arrivals at t=1, t=2... are fixed.
+            # New orders placed at 't' arrive at 't+L'.
+            
+            on_order = sum(qty for arr_t, qty in pipeline.items() if arr_t > t)
+            net_inv = inv - back
+            ip = net_inv + on_order
+            
+            # 2. Place Order (Review Period)
+            # Order up to Base Stock Level
+            # If disrupted or overseas disabled, we CANNOT order overseas.
+            
+            # Theoretical Policy Target: Order = Max(0, B - IP)
+            raw_order = max(0, base_stock_level - ip)
+            
+            # Apply Constraints
+            # In this 'Simple' policy, we assume we want to use the Cheap Overseas supplier.
+            
+            actual_order_os = 0
+            actual_order_loc = 0
+            
+            # Check availability at time 't'
+            # Note: scenario['overseas_available'] is a list of bools
+            if overseas_enabled and scenario['overseas_available'][t]:
+                actual_order_os = raw_order
+            elif local_enabled:
+                # Fallback to local if primary is down (Simple Managers Heuristic)
+                # But capped at capacity
+                actual_order_loc = min(raw_order, LOCAL_CAPACITY)
+            
+            # Record Order Cost
+            total_cost += (actual_order_os * OVERSEAS_COST) + (actual_order_loc * LOCAL_COST)
+            
+            # Add to Pipeline
+            # Local arrives T+1
+            if actual_order_loc > 0:
+                arr_t = t + 1
+                pipeline[arr_t] = pipeline.get(arr_t, 0) + actual_order_loc
+            
+            # Overseas arrives T+3
+            if actual_order_os > 0:
+                arr_t = t + 3
+                pipeline[arr_t] = pipeline.get(arr_t, 0) + actual_order_os
+            
+            # 3. Receive Arrivals (Start of week/During week)
+            # At start of week t, orders scheduled for t arrive.
+            arrivals = pipeline.get(t, 0)
+            
+            # 4. Satisfy Demand
+            demand = scenario['demand'][t]
+            
+            # Balance
+            # Start Inv = Prev End Inv
+            # Available = Start + Arrivals
+            available = (inv - back) + arrivals
+            
+            if available >= demand:
+                inv = available - demand
+                back = 0
+            else:
+                back = demand - available
+                inv = 0
+            
+            # 5. Cost
+            total_cost += (inv * HOLDING_COST) + (back * BACKORDER_COST)
+            
+            scenario_history.append({
+                "Week": t,
+                "Net Inventory": inv - back,
+                "Policy": "Base Stock"
+            })
+            
+        results.append({
+            "Cost": total_cost,
+            "History": scenario_history
+        })
+        
+    return results
 
 # --- Optimization Model ---
 def solve_optimization(
@@ -359,105 +519,153 @@ def show_optimizer():
             # 1. Generate Scenarios
             scenarios = generate_scenarios(n_scenarios, effective_horizon, disruption_rem, seed)
             
-            # 2. Solve
-            res = solve_optimization(
+            # 2. Solve Optimization (The "AI")
+            res_opt = solve_optimization(
                 on_hand, backlog, 
                 pipe_local, pipe_os1, pipe_os2, pipe_os3,
-                scenarios, effective_horizon, local_on, overseas_on,
-                apply_terminal_value=apply_terminal
+                scenarios, effective_horizon, local_on, overseas_on
             )
             
-            st.session_state['res'] = res
+            # 3. Simulate Base Stock (The "Benchmark")
+            optimal_B, critical_ratio = calculate_optimal_base_stock()
+            res_bs = simulate_base_stock_policy(
+                optimal_B,
+                on_hand, backlog,
+                pipe_local, pipe_os1, pipe_os2, pipe_os3,
+                scenarios, effective_horizon, local_on, overseas_on
+            )
+            
+            # Process Benchmark Results
+            bs_costs = [r['Cost'] for r in res_bs]
+            bs_history = [item for r in res_bs for item in r['History']]
+            
+            df_costs_bs = pd.DataFrame({"Cost": bs_costs, "Policy": "Base Stock"})
+            df_sim_bs = pd.DataFrame(bs_history)
+            
+            # Merge
+            df_costs_all = pd.concat([res_opt['df_costs'], df_costs_bs])
+            df_sim_all = pd.concat([res_opt['df_sim'], df_sim_bs])
+
+            st.session_state['res'] = {
+                'opt': res_opt,
+                'bs': {
+                    'B': optimal_B,
+                    'CR': critical_ratio,
+                    'df_costs': df_costs_bs,
+                    'df_sim': df_sim_bs
+                },
+                'combined': {
+                    'df_costs': df_costs_all,
+                    'df_sim': df_sim_all
+                }
+            }
 
     if 'res' in st.session_state:
         res = st.session_state['res']
+        res_opt = res['opt']
+        res_bs = res['bs']
         
         # --- Main Recommendation ---
         st.markdown("---")
         st.subheader(f"✅ Recommendations for Week {current_week}")
-        st.caption("Enter these orders into the game *now*.")
+        st.caption("AI-Derived Optimal Orders")
         
-        col_rec1, col_rec2 = st.columns(2)
+        col_rec1, col_rec2, col_stats = st.columns([1, 1, 2])
         
         with col_rec1:
-            st.info("**Local Order** (Cost 6.5, Lead 1 wk)")
-            st.metric("Quantity", f"{res['local_order']:,.0f}", delta=None)
-            st.caption("Quick but expensive. Use when backlog triggers are high.")
+            st.info("**Local Order**")
+            st.metric("Qty", f"{res_opt['local_order']:,.0f}")
+            st.caption("Lead 1 wk | Cost $6.5")
             
         with col_rec2:
-            st.info("**Overseas Order** (Cost 5.0, Lead 3 wks)")
-            st.metric("Quantity", f"{res['overseas_order']:,.0f}", delta=None)
-            st.caption("Cheap but slow. Main source of stock.")
-        
-        # --- Risk Analysis ---
-        st.markdown("### 📊 Predicted Outcomes (End of Week T+1)")
-        st.caption("Projected status *after* current decisions takes effect (Next Week).")
-        r1, r2, r3 = st.columns(3)
-        r1.metric(
-            "Backorder Risk", 
-            f"{res['prob_backorder_t1']*100:.1f}%",
-            help="Probability of having ANY backorders next week."
-        )
-        r2.metric(
-            "Exp. Net Inventory", 
-            f"{res['expected_inv_t1']:,.0f}",
-            help="Average projected inventory (Inventory - Backlog)."
-        )
-        r3.metric(
-            "Avg Scenario Cost", 
-            f"${res['df_costs']['Cost'].mean():,.0f}",
-            help="Average total cost over the 8-week horizon."
-        )
-        
+            st.info("**Overseas Order**")
+            st.metric("Qty", f"{res_opt['overseas_order']:,.0f}")
+            st.caption("Lead 3 wks | Cost $5.0")
+            
+        with col_stats:
+            # Comparison with Tool
+            st.warning("📊 **Benchmark Comparison**")
+            
+            # Calculate what Base Stock Would Order NOW
+            # Net Inv + Pipeline
+            pipeline_total = pipe_local + pipe_os1 + pipe_os2 + pipe_os3
+            current_ip = (on_hand - backlog) + pipeline_total
+            bs_order = max(0, res_bs['B'] - current_ip)
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Theoretical Base Stock", f"{res_bs['B']:,.0f}", help=f"Optimal B for {res_bs['CR']:.0%} Service Level")
+            c2.metric("Base Stock Order", f"{bs_order:,.0f}", delta=f"{res_opt['local_order'] + res_opt['overseas_order'] - bs_order:,.0f} vs AI", help="Using formula max(0, B - IP)")
+            
+            if bs_order > (res_opt['local_order'] + res_opt['overseas_order']):
+                 st.caption("🤖 AI assumes demand may drop or costs rising.")
+            else:
+                 st.caption("🤖 AI is stocking up (likely disruption fear).")
+
         # --- Visualizations ---
-        tab1, tab2 = st.tabs(["Inventory Projection", "Cost Distribution"])
+        st.markdown("### ⚔️ Strategy Duel: AI vs. Textbook")
+        
+        tab1, tab2, tab3 = st.tabs(["Cost Comparison", "Inventory Dynamics", "Why is AI Better?"])
         
         with tab1:
-            st.markdown("#### Inventory Fan Chart (Net Inventory)")
-            st.info(
-                """
-                **How to read:**
-                *   **Blue Line (Middle)**: Most likely inventory level.
-                *   **Shaded Area**: Range of outcomes (10th to 90th percentile).
-                *   **Risk**: If the shaded area drops below 0, there is a risk of backlog.
-                """
-            )
-            # Aggregate stats by week
-            df = res['df_sim']
-            stats = df.groupby("Week")["Net Inventory"].quantile([0.1, 0.5, 0.9]).unstack()
-            stats.columns = ["P10", "P50", "P90"]
-            stats = stats.reset_index()
+            st.markdown("#### Distribution of Total Costs (Lower is Better)")
+            st.caption("We simulated 300 futures for both strategies. The AI strategy usually shifts the curve to the left (cheaper).")
             
-            # Transform for Altair
-            base = alt.Chart(stats).encode(x="Week:O")
+            # Calculate Averages
+            avg_opt = res_opt['df_costs']['Cost'].mean()
+            avg_bs = res_bs['df_costs']['Cost'].mean()
             
-            # Area for P10-P90
-            area = base.mark_area(opacity=0.3, color='blue').encode(
-                y='P10', 
-                y2='P90'
-            )
+            c1, c2 = st.columns(2)
+            c1.metric("Avg Cost (AI)", f"${avg_opt:,.0f}")
+            c2.metric("Avg Cost (Base Stock)", f"${avg_bs:,.0f}", delta=f"${avg_opt - avg_bs:,.0f}", delta_color="inverse")
+
+            chart = alt.Chart(res['combined']['df_costs']).mark_area(
+                opacity=0.5,
+                interpolate='step'
+            ).encode(
+                x=alt.X("Cost", bin=alt.Bin(maxbins=30)),
+                y=alt.Y('count()', stack=None),
+                color='Policy'
+            ).properties(height=300)
             
-            # Line for Median
-            line = base.mark_line(color='blue').encode(
-                y='P50'
-            )
+            st.altair_chart(chart, use_container_width=True)
             
-            st.altair_chart((area + line).interactive(), use_container_width=True)
-        
         with tab2:
-            st.markdown("#### Cost Distribution across Scenarios")
-            st.info(
-                """
-                **How to read:**
-                *   **Bars**: Show how many scenarios result in a specific total cost.
-                *   **Goal**: You want tall bars on the *left* (low cost).
-                *   **Tail**: Bars far to the *right* show "disaster" scenarios (high cost).
-                """
-            )
-            chart = alt.Chart(res['df_costs']).mark_bar().encode(
-                x=alt.X("Cost", bin=True),
-                y='count()'
-            )
+            st.markdown("#### Inventory Levels over Time")
+            st.caption("Comparison of Net Inventory behavior. Does the AI keep leaner stock?")
+            
+            # Aggregate stats by week & Policy
+            df_all = res['combined']['df_sim']
+            
+            # Simpler: standard aggregation
+            agg = df_all.groupby(["Week", "Policy"])["Net Inventory"].mean().reset_index()
+            
+            base = alt.Chart(agg).mark_line(point=True).encode(
+                x="Week:O",
+                y="Net Inventory",
+                color="Policy",
+                tooltip=["Week", "Policy", "Net Inventory"]
+            ).properties(height=300)
+            
+            # Add Horizontal Rule for Base Stock B
+            rule = alt.Chart(pd.DataFrame({'B': [res_bs['B']]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='B')
+            
+            st.altair_chart((base + rule).interactive(), use_container_width=True)
+
+        with tab3:
+            st.markdown("### 🧠 Logic Explanation")
+            st.markdown(f"""
+            #### 1. The "Base Stock" Policy
+            *   **Formula**: $B = \mu(r+L) + z\sigma\sqrt{{r+L}}$
+            *   **Your Inputs**: Analysis of *Standard Normal Demand* requires a Stock Level of **{res_bs['B']:,.0f}**.
+            *   **Flaw**: This policy is static. It does not know about the **End of Game** (holding useless stock in week 20) or **Disruptions** (sudden capacity loss).
+            
+            #### 2. The "Stochastic Optimizer" (AI)
+            *   **Optimization**: It explicitly minimizes cost over 300 unique future scenarios.
+            *   **Dynamic**: 
+                *   If it sees a Disruption Risk, it pre-orders (Panic Buying) \u2192 *Analysis: See if Inventory Chart provides a spike.*
+                *   If the game is ending, it stops ordering \u2192 *Analysis: AI Inventory drops to 0 at the end, Base Stock stays high.*
+                *   It uses the **Dual Source**, balancing the cheap Overseas option against the fast Local one.
+            """)
             st.altair_chart(chart, use_container_width=True)
 
 # --- Navigation ---
